@@ -18,11 +18,11 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 
 use futures::{
     StreamExt as _,
-    future::{join, join_all},
+    future::{join_all, try_join},
 };
 use libp2p::{
     PeerId,
@@ -31,7 +31,11 @@ use libp2p::{
     swarm::{StreamProtocol, SwarmEvent, dial_opts::DialOpts, dummy},
     tcp, yamux,
 };
-use tokio::time::{Instant, sleep_until, timeout};
+use tokio::{
+    fs::{self, File},
+    io::AsyncWriteExt,
+    time::{Instant, sleep, sleep_until, timeout},
+};
 
 const BOOTNODES: [&str; 4] = [
     "QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
@@ -42,34 +46,65 @@ const BOOTNODES: [&str; 4] = [
 
 const IPFS_PROTO_NAME: StreamProtocol = StreamProtocol::new("/ipfs/kad/1.0.0");
 
+const DATA_DIR: &str = "data";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
-    let target_id = PeerId::random();
+    fs::create_dir_all(DATA_DIR).await?;
+    File::create(Path::new(DATA_DIR).join(".gitignore"))
+        .await?
+        .write_all(b"*")
+        .await?;
+    let tasks = (0..100)
+        .map(|i| async move {
+            sleep(Duration::from_secs(i * 11)).await;
+            let target_id = PeerId::random();
+            if let Err(err) = track_peer_group(target_id, Duration::from_secs(20 * 60 * 60)).await {
+                tracing::warn!(%target_id, %err)
+            }
+        })
+        .collect::<Vec<_>>();
+    join_all(tasks).await;
+    Ok(())
+}
+
+async fn track_peer_group(target_id: PeerId, duration: Duration) -> anyhow::Result<()> {
     tracing::info!(%target_id);
+    let data_dir = Path::new(DATA_DIR).join(target_id.to_base58());
+    fs::create_dir(&data_dir).await?;
     let closest_peers = get_closest_peers(target_id).await?;
     if closest_peers.len() != 20 {
         anyhow::bail!("insufficient closest peers")
     }
-    let _ = timeout(
-        Duration::from_secs(5 * 60),
-        probe_peer_group(target_id, closest_peers),
+    match timeout(
+        duration,
+        probe_peer_group(target_id, closest_peers, data_dir),
     )
-    .await;
-    Ok(())
+    .await
+    {
+        Err(_) => Ok(()),
+        Ok(Err(err)) => anyhow::bail!(err),
+        Ok(Ok(())) => unreachable!(),
+    }
 }
 
-async fn probe_peer_group(target_id: PeerId, closest_peers: Vec<PeerInfo>) {
+async fn probe_peer_group(
+    target_id: PeerId,
+    closest_peers: Vec<PeerInfo>,
+    data_dir: impl AsRef<Path>,
+) -> anyhow::Result<()> {
     let start = Instant::now();
     let query_task = async {
-        let mut probe_at = start + Duration::from_secs(60);
+        let mut data_file = File::create_new(data_dir.as_ref().join("query.csv")).await?;
+        let mut probe_at = start + Duration::from_secs(60 + 1);
         loop {
             sleep_until(probe_at).await;
-            probe_at += Duration::from_secs(60);
+            probe_at += Duration::from_secs(10 * 60);
             let current_closest_peers = match get_closest_peers(target_id).await {
                 Ok(peers) => peers,
                 Err(err) => {
-                    tracing::warn!(%err, "query");
+                    tracing::warn!(%err, "Query");
                     continue;
                 }
             };
@@ -81,11 +116,18 @@ async fn probe_peer_group(target_id: PeerId, closest_peers: Vec<PeerInfo>) {
                         .any(|other_peer| other_peer.peer_id == peer.peer_id)
                 })
                 .count();
-            tracing::info!(at = ?(Instant::now() - start), %count, "query");
+            let elapsed = start.elapsed();
+            tracing::info!(?elapsed, %target_id, %count, "Query");
+            data_file
+                .write_all(format!("{},{target_id},query,{count}\n", elapsed.as_secs_f32()).as_bytes())
+                .await?
         }
+        #[allow(unreachable_code)]
+        anyhow::Ok(())
     };
     let check_task = async {
-        let mut probe_at = start + Duration::from_secs(60);
+        let mut data_file = File::create_new(data_dir.as_ref().join("check.csv")).await?;
+        let mut probe_at = start + Duration::from_secs(60 + 1);
         loop {
             sleep_until(probe_at).await;
             probe_at += Duration::from_secs(60);
@@ -98,10 +140,17 @@ async fn probe_peer_group(target_id: PeerId, closest_peers: Vec<PeerInfo>) {
             .into_iter()
             .filter(Result::is_ok)
             .count();
-            tracing::info!(at = ?(Instant::now() - start), %count, "check")
+            let elapsed = start.elapsed();
+            tracing::info!(?elapsed, %target_id, %count, "Check");
+            data_file
+                .write_all(format!("{},{target_id},check,{count}\n", elapsed.as_secs_f32()).as_bytes())
+                .await?
         }
+        #[allow(unreachable_code)]
+        anyhow::Ok(())
     };
-    join(query_task, check_task).await;
+    try_join(query_task, check_task).await?;
+    Ok(())
 }
 
 async fn get_closest_peers(peer_id: PeerId) -> anyhow::Result<Vec<PeerInfo>> {
@@ -191,19 +240,19 @@ async fn check_liveness(peer: PeerInfo) -> anyhow::Result<()> {
             SwarmEvent::Dialing {
                 peer_id: Some(peer_id),
                 ..
-            } => tracing::debug!(%peer_id, "dialing"),
+            } => tracing::debug!(%peer_id, "Dialing"),
 
             SwarmEvent::ConnectionEstablished {
                 peer_id: connected_id,
                 ..
             } => {
                 anyhow::ensure!(connected_id == peer.peer_id);
-                tracing::info!(%peer.peer_id, "peer alive");
+                tracing::debug!(%peer.peer_id, "Peer alive");
                 return Ok(());
             }
 
             SwarmEvent::OutgoingConnectionError { error, .. } => {
-                tracing::warn!(%error);
+                tracing::debug!(%error);
                 anyhow::bail!(error)
             }
 
