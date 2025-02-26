@@ -13,7 +13,7 @@ def main():
         .sort("hour")
     )
     print(df_hours)
-    df_hours.plot.line(x="hour", y="count", color="op")#.save("count.png")
+    df_hours.plot.line(x="hour", y="count", color="op").save("count.png")
 
 
 if __name__ == "__main__":
